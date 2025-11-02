@@ -239,6 +239,10 @@ def classify_vendor_and_item(vendor: str, item: str) -> tuple[str | None, str | 
             profession = "Artisan"
             category = "Vehicle"
 
+    elif "buffbot" in v:
+        profession = "Doctor"
+        category = "Buff"
+
     elif "chef" in v:
         profession = "Chef"
         category = "Chef"
