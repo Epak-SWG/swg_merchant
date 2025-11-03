@@ -566,12 +566,11 @@ def main():
 
     ap = argparse.ArgumentParser(description="Parse SWG .mail vendor sales into SQLite.")
     ap.add_argument("path", help="Path to a .mail file or a folder containing .mail files")
-    ap.add_argument("-r", "--recursive", action="store_true", help="Recurse into subfolders")
     ap.add_argument("--db", default=str(DEFAULT_DB), help="Path to SQLite DB (default: swg_merchant.db)")
     args = ap.parse_args()
 
     target = Path(args.path)
-    mail_files = iter_mail_paths(target, args.recursive)
+    mail_files = iter_mail_paths(target, recursive=True)
 
     if not mail_files:
         print(f"[INFO] No .mail files found at: {target}")

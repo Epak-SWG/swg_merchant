@@ -7,7 +7,7 @@ A Python 3 utility that parses Star Wars Galaxies `.mail` vendor transaction log
 - Parses both **sales** (`Vendor Sale Complete`) and **purchases** (`Vendor Item Purchased`) from `.mail` files.
 - Creates and maintains SQLite tables: `customers`, `sales`, `purchases`, and `mail_ingests`.
 - Prevents duplicate parsing and auto-reparses incomplete records.
-- Supports recursive scanning with `--recursive`.
+- Recursive scanning by default to fill missing information on previous logged mails.
 - Automatically classifies vendors and items by profession and category.
 - Trims trailing suffixes like `| Epak` from item names.
 
@@ -16,9 +16,6 @@ A Python 3 utility that parses Star Wars Galaxies `.mail` vendor transaction log
 ```bash
 # Parse all .mail files in a folder (non-recursive)
 python swg_merchant.py /path/to/folder
-
-# Parse recursively
-python swg_merchant.py /path/to/folder -r
 
 # Parse a single .mail file
 python swg_merchant.py /path/to/file.mail
