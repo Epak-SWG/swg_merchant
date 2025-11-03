@@ -26,7 +26,7 @@ Usage:
   python swg_merchant.py /path/to/folder --db ./swg_merchant.db
 """
 
-import re
+import re, hashlib
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
@@ -68,6 +68,28 @@ CREATE TABLE IF NOT EXISTS purchases (
     category   TEXT
 );
 
+CREATE TABLE IF NOT EXISTS processed_mails (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    mail_id       TEXT,
+    file_path     TEXT NOT NULL,
+    file_mtime    INTEGER NOT NULL,
+    inserted_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(mail_id),
+    UNIQUE(file_path)
+);
+
+-- Tracks which DB rows came from which .mail file
+CREATE TABLE IF NOT EXISTS mail_rows (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_path   TEXT NOT NULL,
+    table_name  TEXT NOT NULL CHECK (table_name IN ('sales','purchases')),
+    row_id      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mail_rows_file ON mail_rows(file_path);
+CREATE INDEX IF NOT EXISTS idx_mail_rows_row  ON mail_rows(table_name, row_id);
+CREATE INDEX IF NOT EXISTS idx_processed_mails_mailid ON processed_mails(mail_id);
+CREATE INDEX IF NOT EXISTS idx_processed_mails_path   ON processed_mails(file_path);
 CREATE INDEX IF NOT EXISTS idx_purchases_date     ON purchases(sale_date);
 CREATE INDEX IF NOT EXISTS idx_purchases_category ON purchases(category);
 CREATE INDEX IF NOT EXISTS idx_purchases_vendor    ON purchases(vendor);
@@ -95,6 +117,89 @@ def get_or_create_customer(conn: sqlite3.Connection, name: str) -> int:
     cur = conn.execute("INSERT INTO customers (name) VALUES (?)", (name,))
     conn.commit()
     return cur.lastrowid
+
+def get_mail_identity(p: Path) -> tuple[str | None, int]:
+    """
+    Returns (mail_id, file_mtime).
+    Assumes first non-empty line is the mail id (the numeric line at the top).
+    """
+    mail_id = None
+    with p.open("r", encoding="utf-8", errors="ignore") as f:
+        for ln in f:
+            s = ln.strip()
+            if s:
+                mail_id = s  # first non-empty line
+                break
+    mtime = int(p.stat().st_mtime)
+    return mail_id, mtime
+
+def is_mail_processed(conn: sqlite3.Connection, *, mail_id: str | None, file_path: str) -> bool:
+    # Check by mail_id if present, otherwise by path
+    if mail_id:
+        cur = conn.execute("SELECT 1 FROM processed_mails WHERE mail_id = ? LIMIT 1", (mail_id,))
+        if cur.fetchone():
+            return True
+    cur = conn.execute("SELECT 1 FROM processed_mails WHERE file_path = ? LIMIT 1", (file_path,))
+    return cur.fetchone() is not None
+
+def mark_mail_processed(conn: sqlite3.Connection, *, mail_id: str | None, file_path: str, file_mtime: int) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO processed_mails (mail_id, file_path, file_mtime) VALUES (?, ?, ?)",
+        (mail_id, file_path, file_mtime),
+    )
+    conn.commit()
+
+def link_row_to_mail(conn: sqlite3.Connection, *, file_path: str, table_name: str, row_id: int) -> None:
+    conn.execute(
+        "INSERT INTO mail_rows (file_path, table_name, row_id) VALUES (?, ?, ?)",
+        (file_path, table_name, row_id),
+    )
+
+def has_incomplete_rows_for_file(conn: sqlite3.Connection, *, file_path: str) -> bool:
+    # Any SALES linked to this file with NULLs?
+    cur = conn.execute("""
+        SELECT 1
+        FROM sales s
+        JOIN mail_rows mr ON mr.table_name = 'sales' AND mr.row_id = s.id
+        WHERE mr.file_path = ?
+          AND (s.profession IS NULL OR s.category IS NULL)
+        LIMIT 1
+    """, (file_path,))
+    if cur.fetchone():
+        return True
+
+    # Any PURCHASES linked to this file with NULLs?
+    cur = conn.execute("""
+        SELECT 1
+        FROM purchases p
+        JOIN mail_rows mr ON mr.table_name = 'purchases' AND mr.row_id = p.id
+        WHERE mr.file_path = ?
+          AND (p.category IS NULL)
+        LIMIT 1
+    """, (file_path,))
+    return cur.fetchone() is not None
+
+def purge_rows_for_file(conn: sqlite3.Connection, *, file_path: str) -> None:
+    # Delete linked sales
+    conn.execute("""
+        DELETE FROM sales
+        WHERE id IN (
+            SELECT row_id FROM mail_rows
+            WHERE file_path = ? AND table_name = 'sales'
+        )
+    """, (file_path,))
+    # Delete linked purchases
+    conn.execute("""
+        DELETE FROM purchases
+        WHERE id IN (
+            SELECT row_id FROM mail_rows
+            WHERE file_path = ? AND table_name = 'purchases'
+        )
+    """, (file_path,))
+    # Remove links + processed flag
+    conn.execute("DELETE FROM mail_rows WHERE file_path = ?", (file_path,))
+    conn.execute("DELETE FROM processed_mails WHERE file_path = ?", (file_path,))
+    conn.commit()
 
 def insert_purchase(conn: sqlite3.Connection, *, sale_date: str, item: str, vendor: str,
                     amount: int, category: str | None = None) -> int:
@@ -454,15 +559,33 @@ def main():
     print(f"[INFO] Found {len(mail_files)} .mail file(s). Parsing and inserting into {args.db} ...")
 
     for p in mail_files:
+        file_path = str(p)
+        mail_id, mtime = get_mail_identity(p)
+
+        already = is_mail_processed(conn, mail_id=mail_id, file_path=file_path)
+        incomplete = has_incomplete_rows_for_file(conn, file_path=file_path)
+
+        if already and not incomplete:
+            print(f"[SKIP] Already processed: {p.name} (mail_id={mail_id})")
+            continue
+
+        if already and incomplete:
+            print(f"[REPARSE] Incomplete data found; purging and reparsing: {p.name}")
+            purge_rows_for_file(conn, file_path=file_path)
+
+        # ---- parse and insert fresh -------------------------------------------
         entry = parse_mail_file(p)
         if not entry:
             failed += 1
             continue
 
-        if entry["type"] == "sale":
-            entry["item"] = re.sub(r"\s*\|\s*Epak\s*$", "", entry["item"], flags=re.IGNORECASE)
-            profession, category = classify_vendor_and_item(entry["type"], entry["vendor"], entry["item"])
-            try:
+        try:
+            if entry["type"] == "sale":
+                # trim trailing " | Epak"
+                entry["item"] = re.sub(r"\s*\|\s*Epak\s*$", "", entry["item"], flags=re.IGNORECASE)
+                profession, category = classify_vendor_and_item(
+                    entry["type"], entry["vendor"], entry["item"]
+                )
                 row_id = insert_sale(
                     conn,
                     sale_date=entry["sale_date"],
@@ -473,29 +596,31 @@ def main():
                     profession=profession,
                     category=category,
                 )
-                inserted += 1
-                print(f"  ✔ SALE id={row_id} :: {entry['vendor']} → {entry['customer']} | {entry['item']}:{profession}:{category}")
-            except Exception as e:
-                failed += 1
-                print(f"  ✖ Failed to insert sale from {p.name}: {e}")
+                link_row_to_mail(conn, file_path=file_path, table_name="sales", row_id=row_id)
 
-        elif entry["type"] == "purchase":
-            profession, category = classify_vendor_and_item(entry["type"], entry["vendor"], entry["item"])
-            try:
+            elif entry["type"] == "purchase":
+                # classify; profession usually N/A for purchases, category may be set
+                profession, category = classify_vendor_and_item(
+                    entry["type"], entry["vendor"], entry["item"]
+                )
                 row_id = insert_purchase(
                     conn,
                     sale_date=entry["sale_date"],
                     item=entry["item"],
-                    vendor=entry["vendor"],
+                    vendor=entry["vendor"],  # or "store" if that's your column name
                     amount=entry["amount"],
                     category=category,
                 )
-                inserted += 1
-                print(f"  ✔ PURCHASE id={row_id} :: {entry['item']}:{category} from {entry['vendor']}")
-            except Exception as e:
-                failed += 1
-                print(f"  ✖ Failed to insert purchase from {p.name}: {e}")
+                link_row_to_mail(conn, file_path=file_path, table_name="purchases", row_id=row_id)
 
+            # mark processed only after success
+            mark_mail_processed(conn, mail_id=mail_id, file_path=file_path, file_mtime=mtime)
+            inserted += 1
+            print(f"  ✔ Ingested from {p.name}")
+
+        except Exception as e:
+            failed += 1
+            print(f"  ✖ Failed to ingest from {p.name}: {e}")
 
 if __name__ == "__main__":
     main()
