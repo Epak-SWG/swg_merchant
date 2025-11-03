@@ -5,13 +5,6 @@ SWG Merchant Log Parser → SQLite
 
 Parses `.mail` files that contain vendor sale entries in this format:
 
-393175791
-SWG.SWG Infinity.auctioner
-Vendor Sale Complete
-TIMESTAMP: 1761901790
-Vendor: World Drops has sold UltraCon Schematic to braylee for 1000000 credits.
-The sale took place at Epak's Emporium, on Corellia.
-
 Usage:
   # Parse all .mail files in a folder (non-recursive)
   python swg_merchant.py /path/to/folder
@@ -26,12 +19,11 @@ Usage:
   python swg_merchant.py /path/to/folder --db ./swg_merchant.db
 """
 
-import re, hashlib
+import re
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
-
 
 # ---------- SQLite setup ----------
 
@@ -63,43 +55,47 @@ CREATE TABLE IF NOT EXISTS purchases (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     sale_date  TEXT    NOT NULL,
     item       TEXT    NOT NULL,
-    vendor      TEXT    NOT NULL,
+    vendor     TEXT    NOT NULL,
     amount     INTEGER NOT NULL CHECK (amount >= 0),
     category   TEXT
 );
 
-CREATE TABLE IF NOT EXISTS processed_mails (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    mail_id       TEXT,
-    file_path     TEXT NOT NULL,
-    file_mtime    INTEGER NOT NULL,
-    inserted_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(mail_id),
-    UNIQUE(file_path)
+/* ---------- Single-row ingest table (replaces processed_mails + mail_rows) ----------
+   Exactly ONE row per .mail file.
+   Each row points to either a sales.id OR a purchases.id via FK.
+*/
+CREATE TABLE IF NOT EXISTS mail_ingests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    mail_id      TEXT,              -- first non-empty line in the file (if present)
+    file_path    TEXT NOT NULL UNIQUE,     -- absolute path
+    file_mtime   INTEGER NOT NULL,  -- os.stat().st_mtime
+    inserted_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    sale_id      INTEGER,           -- FK to sales.id (nullable)
+    purchase_id  INTEGER,           -- FK to purchases.id (nullable)
+
+    CHECK (
+      (sale_id IS NOT NULL AND purchase_id IS NULL) OR
+      (sale_id IS NULL     AND purchase_id IS NOT NULL)
+    ),
+
+    UNIQUE (mail_id),
+
+    FOREIGN KEY (sale_id)     REFERENCES sales(id)      ON DELETE CASCADE,
+    FOREIGN KEY (purchase_id) REFERENCES purchases(id)  ON DELETE CASCADE
 );
 
--- Tracks which DB rows came from which .mail file
-CREATE TABLE IF NOT EXISTS mail_rows (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_path   TEXT NOT NULL,
-    table_name  TEXT NOT NULL CHECK (table_name IN ('sales','purchases')),
-    row_id      INTEGER NOT NULL
-);
+CREATE INDEX IF NOT EXISTS idx_mail_ingests_mtime ON mail_ingests(file_mtime);
 
-CREATE INDEX IF NOT EXISTS idx_mail_rows_file ON mail_rows(file_path);
-CREATE INDEX IF NOT EXISTS idx_mail_rows_row  ON mail_rows(table_name, row_id);
-CREATE INDEX IF NOT EXISTS idx_processed_mails_mailid ON processed_mails(mail_id);
-CREATE INDEX IF NOT EXISTS idx_processed_mails_path   ON processed_mails(file_path);
 CREATE INDEX IF NOT EXISTS idx_purchases_date     ON purchases(sale_date);
 CREATE INDEX IF NOT EXISTS idx_purchases_category ON purchases(category);
-CREATE INDEX IF NOT EXISTS idx_purchases_vendor    ON purchases(vendor);
-CREATE INDEX IF NOT EXISTS idx_sales_date        ON sales(sale_date);
-CREATE INDEX IF NOT EXISTS idx_sales_vendor      ON sales(vendor);
-CREATE INDEX IF NOT EXISTS idx_sales_customer    ON sales(customer_id);
-CREATE INDEX IF NOT EXISTS idx_sales_item        ON sales(item);
-CREATE INDEX IF NOT EXISTS idx_sales_profession  ON sales(profession);
-CREATE INDEX IF NOT EXISTS idx_sales_category    ON sales(category);
-CREATE INDEX IF NOT EXISTS idx_customers_name    ON customers(name);
+CREATE INDEX IF NOT EXISTS idx_purchases_vendor   ON purchases(vendor);
+CREATE INDEX IF NOT EXISTS idx_sales_date         ON sales(sale_date);
+CREATE INDEX IF NOT EXISTS idx_sales_vendor       ON sales(vendor);
+CREATE INDEX IF NOT EXISTS idx_sales_customer     ON sales(customer_id);
+CREATE INDEX IF NOT EXISTS idx_sales_item         ON sales(item);
+CREATE INDEX IF NOT EXISTS idx_sales_profession   ON sales(profession);
+CREATE INDEX IF NOT EXISTS idx_sales_category     ON sales(category);
+CREATE INDEX IF NOT EXISTS idx_customers_name     ON customers(name);
 """
 
 def ensure_db(db_path: Path = DEFAULT_DB) -> sqlite3.Connection:
@@ -118,12 +114,12 @@ def get_or_create_customer(conn: sqlite3.Connection, name: str) -> int:
     conn.commit()
     return cur.lastrowid
 
-def get_mail_identity(p: Path) -> tuple[str | None, int]:
+def get_mail_identity(p: Path) -> tuple[Optional[str], int]:
     """
     Returns (mail_id, file_mtime).
     Assumes first non-empty line is the mail id (the numeric line at the top).
     """
-    mail_id = None
+    mail_id: Optional[str] = None
     with p.open("r", encoding="utf-8", errors="ignore") as f:
         for ln in f:
             s = ln.strip()
@@ -133,113 +129,123 @@ def get_mail_identity(p: Path) -> tuple[str | None, int]:
     mtime = int(p.stat().st_mtime)
     return mail_id, mtime
 
-def is_mail_processed(conn: sqlite3.Connection, *, mail_id: str | None, file_path: str) -> bool:
-    # Check by mail_id if present, otherwise by path
+# ---------- Unified helpers (single-row design) ----------
+
+def is_mail_processed(conn: sqlite3.Connection, *, mail_id: Optional[str], file_path: str) -> bool:
+    """
+    Returns True if we already have an ingest row for this file or mail_id.
+    """
     if mail_id:
-        cur = conn.execute("SELECT 1 FROM processed_mails WHERE mail_id = ? LIMIT 1", (mail_id,))
+        cur = conn.execute("SELECT 1 FROM mail_ingests WHERE mail_id = ? LIMIT 1", (mail_id,))
         if cur.fetchone():
             return True
-    cur = conn.execute("SELECT 1 FROM processed_mails WHERE file_path = ? LIMIT 1", (file_path,))
+    cur = conn.execute("SELECT 1 FROM mail_ingests WHERE file_path = ? LIMIT 1", (file_path,))
     return cur.fetchone() is not None
 
-def mark_mail_processed(conn: sqlite3.Connection, *, mail_id: str | None, file_path: str, file_mtime: int) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO processed_mails (mail_id, file_path, file_mtime) VALUES (?, ?, ?)",
-        (mail_id, file_path, file_mtime),
+
+def upsert_mail_ingest(
+    conn: sqlite3.Connection,
+    *,
+    mail_id: Optional[str],
+    file_path: str,
+    file_mtime: int,
+    sale_id: Optional[int] = None,
+    purchase_id: Optional[int] = None,
+) -> None:
+    """
+    Insert or update the single row for this mail.
+    Exactly one of sale_id/purchase_id must be set (enforced by CHECK).
+    """
+    if (sale_id is None) == (purchase_id is None):
+        raise ValueError("Provide exactly one of sale_id or purchase_id")
+
+    # UPDATE first to keep idempotency
+    cur = conn.execute(
+        """
+        UPDATE mail_ingests
+           SET mail_id     = COALESCE(?, mail_id),
+               file_mtime  = ?,
+               sale_id     = COALESCE(?, sale_id),
+               purchase_id = COALESCE(?, purchase_id),
+               inserted_at = datetime('now')
+         WHERE file_path = ?
+        """,
+        (mail_id, file_mtime, sale_id, purchase_id, file_path),
     )
+    if cur.rowcount == 0:
+        # INSERT if not present
+        conn.execute(
+            """
+            INSERT INTO mail_ingests (mail_id, file_path, file_mtime, sale_id, purchase_id)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (mail_id, file_path, file_mtime, sale_id, purchase_id),
+        )
     conn.commit()
 
-def link_row_to_mail(conn: sqlite3.Connection, *, file_path: str, table_name: str, row_id: int) -> None:
-    conn.execute(
-        "INSERT INTO mail_rows (file_path, table_name, row_id) VALUES (?, ?, ?)",
-        (file_path, table_name, row_id),
-    )
 
 def has_incomplete_rows_for_file(conn: sqlite3.Connection, *, file_path: str) -> bool:
-    # Any SALES linked to this file with NULLs?
-    cur = conn.execute("""
+    """
+    Return True if the linked sales/purchases row has NULLs we plan to fill later.
+    """
+    # SALES with missing profession/category
+    cur = conn.execute(
+        """
         SELECT 1
-        FROM sales s
-        JOIN mail_rows mr ON mr.table_name = 'sales' AND mr.row_id = s.id
-        WHERE mr.file_path = ?
-          AND (s.profession IS NULL OR s.category IS NULL)
-        LIMIT 1
-    """, (file_path,))
+          FROM mail_ingests mi
+          JOIN sales s ON s.id = mi.sale_id
+         WHERE mi.file_path = ?
+           AND (s.profession IS NULL OR s.category IS NULL)
+         LIMIT 1
+        """,
+        (file_path,),
+    )
     if cur.fetchone():
         return True
 
-    # Any PURCHASES linked to this file with NULLs?
-    cur = conn.execute("""
+    # PURCHASES with missing category
+    cur = conn.execute(
+        """
         SELECT 1
-        FROM purchases p
-        JOIN mail_rows mr ON mr.table_name = 'purchases' AND mr.row_id = p.id
-        WHERE mr.file_path = ?
-          AND (p.category IS NULL)
-        LIMIT 1
-    """, (file_path,))
+          FROM mail_ingests mi
+          JOIN purchases p ON p.id = mi.purchase_id
+         WHERE mi.file_path = ?
+           AND (p.category IS NULL)
+         LIMIT 1
+        """,
+        (file_path,),
+    )
     return cur.fetchone() is not None
 
+
 def purge_rows_for_file(conn: sqlite3.Connection, *, file_path: str) -> None:
-    # Delete linked sales
-    conn.execute("""
-        DELETE FROM sales
-        WHERE id IN (
-            SELECT row_id FROM mail_rows
-            WHERE file_path = ? AND table_name = 'sales'
-        )
-    """, (file_path,))
-    # Delete linked purchases
-    conn.execute("""
-        DELETE FROM purchases
-        WHERE id IN (
-            SELECT row_id FROM mail_rows
-            WHERE file_path = ? AND table_name = 'purchases'
-        )
-    """, (file_path,))
-    # Remove links + processed flag
-    conn.execute("DELETE FROM mail_rows WHERE file_path = ?", (file_path,))
-    conn.execute("DELETE FROM processed_mails WHERE file_path = ?", (file_path,))
-    conn.commit()
+    """
+    Delete the sales/purchases row referenced by this mail, then remove the ingest row.
+    """
+    row = conn.execute(
+        "SELECT sale_id, purchase_id FROM mail_ingests WHERE file_path = ?",
+        (file_path,),
+    ).fetchone()
 
-def insert_purchase(conn: sqlite3.Connection, *, sale_date: str, item: str, vendor: str,
-                    amount: int, category: str | None = None) -> int:
-    """Insert a purchase into the purchases table."""
-    cur = conn.execute(
-        """INSERT INTO purchases (sale_date, item, vendor, amount, category)
-           VALUES (?, ?, ?, ?, ?)""",
-        (sale_date, item, vendor, amount, category),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-def insert_sale(conn: sqlite3.Connection, *, sale_date: str, vendor: str, item: str,
-                customer: str, amount: int, profession: str | None = None,
-                category: str | None = None) -> int:
-    """Insert a sale linked to a customer."""
-    cust_id = get_or_create_customer(conn, customer)
-
-    cur = conn.execute(
-        """INSERT INTO sales (sale_date, vendor, item, customer_id, amount, profession, category)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (sale_date, vendor, item, cust_id, amount, profession, category),
-    )
-
-    # Update customer aggregates
-    conn.execute(
-        """UPDATE customers
-           SET total_spent = total_spent + ?, total_purchases = total_purchases + 1
-           WHERE id = ?""",
-        (amount, cust_id),
-    )
+    if row:
+        sale_id, purchase_id = row
+        if sale_id:
+            conn.execute("DELETE FROM sales WHERE id = ?", (sale_id,))
+        if purchase_id:
+            conn.execute("DELETE FROM purchases WHERE id = ?", (purchase_id,))
+        conn.execute("DELETE FROM mail_ingests WHERE file_path = ?", (file_path,))
 
     conn.commit()
-    return cur.lastrowid
 
 
 # ---------- Parsing ----------
 
 SALE_RE = re.compile(
     r"Vendor:\s*(?P<vendor>.+?)\s+has sold\s+(?P<item>.+?)\s+to\s+(?P<customer>.+?)\s+for\s+(?P<amount>\d+)\s+credits",
+    re.IGNORECASE,
+)
+PURCHASE_RE = re.compile(
+    r"You have won the auction of \"(?P<item>.+?)\" from \"(?P<vendor>.+?)\" for (?P<amount>\d+) credits.*",
     re.IGNORECASE,
 )
 TS_RE = re.compile(r"TIMESTAMP:\s*(?P<ts>\d+)", re.IGNORECASE)
@@ -300,11 +306,7 @@ def parse_mail_file(file_path: Path) -> Optional[dict]:
 
     elif "Vendor Item Purchased" in event_line:
         # Example: You have won the auction of "Geonosian Power Cube (Red)" from "BobCraft" for 40000 credits.  See the attached waypoint for location.
-        pm = re.search(
-            r"You have won the auction of \"(?P<item>.+?)\"\sfrom\s\"(?P<vendor>.+?)\sfor\s(?P<amount>\d+)\s+credits.*",
-            sale_line,
-            re.IGNORECASE,
-        )
+        pm = PURCHASE_RE.search(sale_line)
         if not pm:
             print(f"[WARN] {file_path.name}: could not parse purchase line:\n       {sale_line}")
             return None
@@ -320,22 +322,10 @@ def parse_mail_file(file_path: Path) -> Optional[dict]:
         print(f"[WARN] {file_path.name}: unknown event type: {event_line}")
         return None
 
-def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[str | None, str | None]:
+def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[Optional[str], Optional[str]]:
     """
     Determine (profession, category) based on vendor and item name.
 
-    Rules:
-      Vendor name:
-        "world drops"       -> category = "Loot"
-        "weapons"           -> profession = "weaponsmith"
-        "armor and vehicles"-> profession = "armorsmith"
-        "pets"              -> profession = "Bio-Engineer"
-
-      Item name (used if category not already set):
-        contains "pistol"        -> category = "Pistol"
-        contains "carbine"       -> category = "Carbine"
-        contains "rifle"         -> category = "Rifle"
-        contains "flame thrower" -> category = "Commando"
     """
     profession, category = None, None
 
@@ -443,7 +433,7 @@ def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[s
                 category = "Commando"
             elif "launcher pistol" in i:
                 category = "Commando"
-            elif "Long Vibro Axe" in i:
+            elif "long vibro axe" in i:
                 category = "Polearm"
             elif "nightsister energy lance" in i:
                 category = "Polearm"
@@ -459,7 +449,7 @@ def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[s
                 category = "One Hand"
             elif "rifle" in i:
                 category = "Rifle"
-            elif "Vibro Knuckler" in i:
+            elif "vibro knuckler" in i:
                 category = "Unarmed"
 
         elif "world drops" in v:
@@ -470,7 +460,7 @@ def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[s
                 category = "Tapes"
             elif "crystal" in i:
                 category = "Crystal"
-            elif "Geonosian Power" in i:
+            elif "geonosian power" in i:
                 category = "Component"
             elif "holocron" in i:
                 category = "Misc"
@@ -498,7 +488,7 @@ def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[s
                 category = "Commando"
             elif "launcher pistol" in i:
                 category = "Commando"
-            elif "Long Vibro Axe" in i:
+            elif "long vibro axe" in i:
                 category = "Polearm"
             elif "nightsister energy lance" in i:
                 category = "Polearm"
@@ -514,7 +504,7 @@ def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[s
                 category = "One Hand"
             elif "rifle" in i:
                 category = "Rifle"
-            elif "Vibro Knuckler" in i:
+            elif "vibro knuckler" in i:
                 category = "Unarmed"
 
     elif entry_type == "purchase":
@@ -534,6 +524,41 @@ def iter_mail_paths(target: Path, recursive: bool) -> list[Path]:
         return []
     pattern = "**/*.mail" if recursive else "*.mail"
     return sorted(target.glob(pattern))
+
+
+def insert_purchase(conn: sqlite3.Connection, *, sale_date: str, item: str, vendor: str,
+                    amount: int, category: Optional[str] = None) -> int:
+    """Insert a purchase into the purchases table."""
+    cur = conn.execute(
+        """INSERT INTO purchases (sale_date, item, vendor, amount, category)
+           VALUES (?, ?, ?, ?, ?)""",
+        (sale_date, item, vendor, amount, category),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+def insert_sale(conn: sqlite3.Connection, *, sale_date: str, vendor: str, item: str,
+                customer: str, amount: int, profession: Optional[str] = None,
+                category: Optional[str] = None) -> int:
+    """Insert a sale linked to a customer."""
+    cust_id = get_or_create_customer(conn, customer)
+
+    cur = conn.execute(
+        """INSERT INTO sales (sale_date, vendor, item, customer_id, amount, profession, category)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (sale_date, vendor, item, cust_id, amount, profession, category),
+    )
+
+    # Update customer aggregates
+    conn.execute(
+        """UPDATE customers
+           SET total_spent = total_spent + ?, total_purchases = total_purchases + 1
+           WHERE id = ?""",
+        (amount, cust_id),
+    )
+
+    conn.commit()
+    return cur.lastrowid
 
 
 def main():
@@ -596,10 +621,15 @@ def main():
                     profession=profession,
                     category=category,
                 )
-                link_row_to_mail(conn, file_path=file_path, table_name="sales", row_id=row_id)
+                upsert_mail_ingest(
+                    conn,
+                    mail_id=mail_id,
+                    file_path=file_path,
+                    file_mtime=mtime,
+                    sale_id=row_id,
+                )
 
             elif entry["type"] == "purchase":
-                # classify; profession usually N/A for purchases, category may be set
                 profession, category = classify_vendor_and_item(
                     entry["type"], entry["vendor"], entry["item"]
                 )
@@ -607,20 +637,30 @@ def main():
                     conn,
                     sale_date=entry["sale_date"],
                     item=entry["item"],
-                    vendor=entry["vendor"],  # or "store" if that's your column name
+                    vendor=entry["vendor"],
                     amount=entry["amount"],
                     category=category,
                 )
-                link_row_to_mail(conn, file_path=file_path, table_name="purchases", row_id=row_id)
+                upsert_mail_ingest(
+                    conn,
+                    mail_id=mail_id,
+                    file_path=file_path,
+                    file_mtime=mtime,
+                    purchase_id=row_id,
+                )
 
-            # mark processed only after success
-            mark_mail_processed(conn, mail_id=mail_id, file_path=file_path, file_mtime=mtime)
             inserted += 1
             print(f"  ✔ Ingested from {p.name}")
 
+        except sqlite3.IntegrityError as e:
+            failed += 1
+            print(f"  ✖ Failed to ingest from {p.name}: {e}")
         except Exception as e:
             failed += 1
             print(f"  ✖ Failed to ingest from {p.name}: {e}")
+
+    print(f"[DONE] Inserted: {inserted}, Failed: {failed}")
+
 
 if __name__ == "__main__":
     main()
