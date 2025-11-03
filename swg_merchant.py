@@ -453,7 +453,7 @@ def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[O
                 category = "Unarmed"
 
         elif "world drops" in v:
-            profession = "loot"
+            profession = "Loot"
             if "[ca]" in i:
                 category = "Tapes"
             elif "[aa]" in i:
@@ -580,6 +580,7 @@ def main():
     conn = ensure_db(Path(args.db))
     inserted = 0
     failed = 0
+    skipped = 0  # <--- new counter
 
     print(f"[INFO] Found {len(mail_files)} .mail file(s). Parsing and inserting into {args.db} ...")
 
@@ -590,8 +591,9 @@ def main():
         already = is_mail_processed(conn, mail_id=mail_id, file_path=file_path)
         incomplete = has_incomplete_rows_for_file(conn, file_path=file_path)
 
+        # --- skip or reparse handling ---
         if already and not incomplete:
-            print(f"[SKIP] Already processed: {p.name} (mail_id={mail_id})")
+            skipped += 1
             continue
 
         if already and incomplete:
@@ -659,7 +661,7 @@ def main():
             failed += 1
             print(f"  ✖ Failed to ingest from {p.name}: {e}")
 
-    print(f"[DONE] Inserted: {inserted}, Failed: {failed}")
+    print(f"[DONE] Inserted: {inserted}, Skipped: {skipped}, Failed: {failed}")
 
 
 if __name__ == "__main__":
