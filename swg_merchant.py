@@ -59,6 +59,18 @@ CREATE TABLE IF NOT EXISTS sales (
     FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS purchases (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_date  TEXT    NOT NULL,
+    item       TEXT    NOT NULL,
+    vendor      TEXT    NOT NULL,
+    amount     INTEGER NOT NULL CHECK (amount >= 0),
+    category   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_purchases_date     ON purchases(sale_date);
+CREATE INDEX IF NOT EXISTS idx_purchases_category ON purchases(category);
+CREATE INDEX IF NOT EXISTS idx_purchases_vendor    ON purchases(vendor);
 CREATE INDEX IF NOT EXISTS idx_sales_date        ON sales(sale_date);
 CREATE INDEX IF NOT EXISTS idx_sales_vendor      ON sales(vendor);
 CREATE INDEX IF NOT EXISTS idx_sales_customer    ON sales(customer_id);
@@ -81,6 +93,17 @@ def get_or_create_customer(conn: sqlite3.Connection, name: str) -> int:
         return row[0]
 
     cur = conn.execute("INSERT INTO customers (name) VALUES (?)", (name,))
+    conn.commit()
+    return cur.lastrowid
+
+def insert_purchase(conn: sqlite3.Connection, *, sale_date: str, item: str, vendor: str,
+                    amount: int, category: str | None = None) -> int:
+    """Insert a purchase into the purchases table."""
+    cur = conn.execute(
+        """INSERT INTO purchases (sale_date, item, vendor, amount, category)
+           VALUES (?, ?, ?, ?, ?)""",
+        (sale_date, item, vendor, amount, category),
+    )
     conn.commit()
     return cur.lastrowid
 
@@ -124,9 +147,9 @@ def _read_nonempty_lines(p: Path) -> list[str]:
 
 def parse_mail_file(file_path: Path) -> Optional[dict]:
     """
-    Parse a single .mail file into a sale dict:
-      { sale_date (ISO), vendor, item, customer, amount }
-    Returns None if parsing fails.
+    Parse a single .mail file into a dict.
+    Returns:
+      {"type": "sale"|"purchase", "sale_date": ..., "vendor": ..., "item": ..., "customer": ..., "amount": ...}
     """
     try:
         lines = _read_nonempty_lines(file_path)
@@ -138,55 +161,61 @@ def parse_mail_file(file_path: Path) -> Optional[dict]:
         print(f"[WARN] {file_path.name}: not enough lines to parse (got {len(lines)}).")
         return None
 
-    # Expected fields by position based on your sample
-    # 0: record_id
-    # 1: source
-    # 2: event
-    # 3: TIMESTAMP: <unix>
-    # 4: Vendor: <vendor> has sold <item> to <customer> for <amount> credits.
-    # 5: The sale took place at <shop>, on <planet>.
+    event_line = lines[2].strip()
     timestamp_line = lines[3]
     sale_line = lines[4]
-    # location_line = lines[5]  # Parsed if you want extra validation; not needed for DB insert
 
-    # Timestamp
     ts_m = TS_RE.search(timestamp_line)
     if not ts_m:
         print(f"[WARN] {file_path.name}: missing TIMESTAMP line.")
         return None
+
     try:
         ts = int(ts_m.group("ts"))
     except ValueError:
         print(f"[WARN] {file_path.name}: invalid TIMESTAMP value.")
         return None
 
-    # Convert to ISO in UTC (consistent, sortable)
     sale_date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    # Sale line
-    sm = SALE_RE.search(sale_line)
-    if not sm:
-        print(f"[WARN] {file_path.name}: could not parse sale line:\n       {sale_line}")
+    # Detect sale or purchase
+    if "Vendor Sale Complete" in event_line:
+        sm = SALE_RE.search(sale_line)
+        if not sm:
+            print(f"[WARN] {file_path.name}: could not parse sale line:\n       {sale_line}")
+            return None
+        return {
+            "type": "sale",
+            "sale_date": sale_date,
+            "vendor": sm.group("vendor").strip(),
+            "item": sm.group("item").strip(),
+            "customer": sm.group("customer").strip(),
+            "amount": int(sm.group("amount")),
+        }
+
+    elif "Vendor Item Purchased" in event_line:
+        # Example: You have won the auction of "Geonosian Power Cube (Red)" from "BobCraft" for 40000 credits.  See the attached waypoint for location.
+        pm = re.search(
+            r"You have won the auction of \"(?P<item>.+?)\"\sfrom\s\"(?P<vendor>.+?)\sfor\s(?P<amount>\d+)\s+credits.*",
+            sale_line,
+            re.IGNORECASE,
+        )
+        if not pm:
+            print(f"[WARN] {file_path.name}: could not parse purchase line:\n       {sale_line}")
+            return None
+        return {
+            "type": "purchase",
+            "sale_date": sale_date,
+            "vendor": pm.group("vendor").strip(),
+            "item": pm.group("item").strip(),
+            "amount": int(pm.group("amount")),
+        }
+
+    else:
+        print(f"[WARN] {file_path.name}: unknown event type: {event_line}")
         return None
 
-    vendor = sm.group("vendor").strip()
-    item = sm.group("item").strip()
-    customer = sm.group("customer").strip()
-    try:
-        amount = int(sm.group("amount"))
-    except ValueError:
-        print(f"[WARN] {file_path.name}: amount is not an integer.")
-        return None
-
-    return {
-        "sale_date": sale_date,
-        "vendor": vendor,
-        "item": item,
-        "customer": customer,
-        "amount": amount,
-    }
-
-def classify_vendor_and_item(vendor: str, item: str) -> tuple[str | None, str | None]:
+def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[str | None, str | None]:
     """
     Determine (profession, category) based on vendor and item name.
 
@@ -207,181 +236,185 @@ def classify_vendor_and_item(vendor: str, item: str) -> tuple[str | None, str | 
 
     v = (vendor or "").casefold()
     i = (item or "").casefold()
-
     # --- item classifications ---
-    if "armor and vehicles" in v:
-        profession = "Armorsmith"
-        if "ab-1" in i:
-            profession = "Artisan"
-            category = "Vehicle"
-        elif "basilisk war droid" in i:
-            profession = "Artisan"
-            category = "Vehicle"
-        elif "bone" in i:
-            category = "Bone Armor"
-        elif "composite" in i:
-            category = "Composite"
-        elif "eta-1" in i:
-            profession = "Artisan"
-            category = "Vehicle"
-        elif "flare s swoop" in i:
-            profession = "Artisan"
-            category = "Vehicle"
-        elif "personal shield" in i:
-            category = "PSG"
-        elif "psg" in i:
-            category = "PSG"
-        elif "r.i.s." in i:
-            category = "RIS"
-        elif "tantel" in i:
-            category = "Tantel"
-        elif "xj-6" in i:
-            profession = "Artisan"
-            category = "Vehicle"
+    if entry_type == "sale":
+        if "armor and vehicles" in v:
+            profession = "Armorsmith"
+            if "ab-1" in i:
+                profession = "Artisan"
+                category = "Vehicle"
+            elif "basilisk war droid" in i:
+                profession = "Artisan"
+                category = "Vehicle"
+            elif "bone" in i:
+                category = "Bone Armor"
+            elif "composite" in i:
+                category = "Composite"
+            elif "eta-1" in i:
+                profession = "Artisan"
+                category = "Vehicle"
+            elif "flare s swoop" in i:
+                profession = "Artisan"
+                category = "Vehicle"
+            elif "personal shield" in i:
+                category = "PSG"
+            elif "psg" in i:
+                category = "PSG"
+            elif "r.i.s." in i:
+                category = "RIS"
+            elif "tantel" in i:
+                category = "Tantel"
+            elif "xj-6" in i:
+                profession = "Artisan"
+                category = "Vehicle"
 
-    elif "buffbot" in v:
-        profession = "Doctor"
-        category = "Buff"
-
-    elif "chef" in v:
-        profession = "Chef"
-        category = "Chef"
-
-    elif "pets" in v:
-        profession = "Bio-Engineer"
-        category = "Pet"
-        if "egg" in i:
-            category = "Incubation"
-
-    elif "pharmaceuticals" in v:
-        if "active" in i:
-            profession = "Bio-Engineer"
-            category = "BE Tissue"
-        elif "buff" in i:
+        elif "buffbot" in v:
             profession = "Doctor"
-            category = "Buff Packs"
-        elif "coagulant" in i:
-            profession = "Bio-Engineer"
-            category = "BE Tissue"
-        elif "cure" in i:
-            profession = "Doctor"
-            category = "Cure Packs"
-        elif "enhance" in i:
-            profession = "Doctor"
-            category = "Buff Packs"
-        elif "fear release" in i:
-            profession = "Bio-Engineer"
-            category = "BE Tissue"
-        elif "hssiss" in i:
-            profession = "Combat Medic"
-            category = "Dart"
-        elif "pet stimpack" in i:
-            profession = "Bio-Engineer"
-            category = "Stimpack"
-        elif "scent neutralization" in i:
-            profession = "Bio-Engineer"
-            category = "BE Tissue"
-        elif "small stimpack" in i:
-            profession = "Doctor"
-            category = "Stimpack"
-        elif "tensile resistance" in i:
-            profession = "Bio-Engineer"
-            category = "BE Tissue"
-        elif "vitality" in i:
-            profession = "Bio-Engineer"
-            category = "Stimpack"
+            category = "Buff"
 
-    elif "resources" in v:
-        profession = "Artisan"
-        category = "Resources"
+        elif "chef" in v:
+            profession = "Chef"
+            category = "Chef"
 
-    elif "weapons" in v:
-        profession = "Weaponsmith"
-        if "carbine" in i:
-            category = "Carbine"
-        elif "two-handed curved sword" in i:
-            category = "Two Hand"
-        elif "curved sword" in i:
-            category = "One Hand"
-        elif "dl44 xt" in i:
-            category = "Pistol"
-        elif "flame thrower" in i or "flamethrower" in i:
-            category = "Commando"
-        elif "launcher pistol" in i:
-            category = "Commando"
-        elif "Long Vibro Axe" in i:
-            category = "Polearm"
-        elif "nightsister energy lance" in i:
-            category = "Polearm"
-        elif "pistol" in i:
-            category = "Pistol"
-        elif "power hammer" in i:
-            category = "Two Hand"
-        elif "republic blaster" in i:
-            category = "Pistol"
-        elif "scout blaster" in i:
-            category = "Pistol"
-        elif "stun baton" in i:
-            category = "One Hand"
-        elif "rifle" in i:
-            category = "Rifle"
-        elif "Vibro Knuckler" in i:
-            category = "Unarmed"
+        elif "pets" in v:
+            profession = "Bio-Engineer"
+            category = "Pet"
+            if "egg" in i:
+                category = "Incubation"
 
-    elif "world drops" in v:
-        profession = "loot"
-        if "[ca]" in i:
-            category = "Tapes"
-        elif "[aa]" in i:
-            category = "Tapes"
-        elif "crystal" in i:
-            category = "Crystal"
-        elif "Geonosian Power" in i:
+        elif "pharmaceuticals" in v:
+            if "active" in i:
+                profession = "Bio-Engineer"
+                category = "BE Tissue"
+            elif "buff" in i:
+                profession = "Doctor"
+                category = "Buff Packs"
+            elif "coagulant" in i:
+                profession = "Bio-Engineer"
+                category = "BE Tissue"
+            elif "cure" in i:
+                profession = "Doctor"
+                category = "Cure Packs"
+            elif "enhance" in i:
+                profession = "Doctor"
+                category = "Buff Packs"
+            elif "fear release" in i:
+                profession = "Bio-Engineer"
+                category = "BE Tissue"
+            elif "hssiss" in i:
+                profession = "Combat Medic"
+                category = "Dart"
+            elif "pet stimpack" in i:
+                profession = "Bio-Engineer"
+                category = "Stimpack"
+            elif "scent neutralization" in i:
+                profession = "Bio-Engineer"
+                category = "BE Tissue"
+            elif "small stimpack" in i:
+                profession = "Doctor"
+                category = "Stimpack"
+            elif "tensile resistance" in i:
+                profession = "Bio-Engineer"
+                category = "BE Tissue"
+            elif "vitality" in i:
+                profession = "Bio-Engineer"
+                category = "Stimpack"
+
+        elif "resources" in v:
+            profession = "Artisan"
+            category = "Resources"
+
+        elif "weapons" in v:
+            profession = "Weaponsmith"
+            if "carbine" in i:
+                category = "Carbine"
+            elif "two-handed curved sword" in i:
+                category = "Two Hand"
+            elif "curved sword" in i:
+                category = "One Hand"
+            elif "dl44 xt" in i:
+                category = "Pistol"
+            elif "flame thrower" in i or "flamethrower" in i:
+                category = "Commando"
+            elif "launcher pistol" in i:
+                category = "Commando"
+            elif "Long Vibro Axe" in i:
+                category = "Polearm"
+            elif "nightsister energy lance" in i:
+                category = "Polearm"
+            elif "pistol" in i:
+                category = "Pistol"
+            elif "power hammer" in i:
+                category = "Two Hand"
+            elif "republic blaster" in i:
+                category = "Pistol"
+            elif "scout blaster" in i:
+                category = "Pistol"
+            elif "stun baton" in i:
+                category = "One Hand"
+            elif "rifle" in i:
+                category = "Rifle"
+            elif "Vibro Knuckler" in i:
+                category = "Unarmed"
+
+        elif "world drops" in v:
+            profession = "loot"
+            if "[ca]" in i:
+                category = "Tapes"
+            elif "[aa]" in i:
+                category = "Tapes"
+            elif "crystal" in i:
+                category = "Crystal"
+            elif "Geonosian Power" in i:
+                category = "Component"
+            elif "holocron" in i:
+                category = "Misc"
+            elif "nightsister clothing" in i:
+                category = "Schematic"
+            elif "pearl" in i:
+                category = "Crystal"
+            elif "schematic" in i:
+                category = "Schematics"
+            elif "venom" in i:
+                category = "Component"
+            elif "treasure map" in i:
+                category = "Treasure Map"
+
+            ############# Looted Weapons #############
+            elif "carbine" in i:
+                category = "Carbine"
+            elif "two-handed curved sword" in i:
+                category = "Two Hand"
+            elif "curved sword" in i:
+                category = "One Hand"
+            elif "dl44 xt" in i:
+                category = "Pistol"
+            elif "flame thrower" in i or "flamethrower" in i:
+                category = "Commando"
+            elif "launcher pistol" in i:
+                category = "Commando"
+            elif "Long Vibro Axe" in i:
+                category = "Polearm"
+            elif "nightsister energy lance" in i:
+                category = "Polearm"
+            elif "pistol" in i:
+                category = "Pistol"
+            elif "power hammer" in i:
+                category = "Two Hand"
+            elif "republic blaster" in i:
+                category = "Pistol"
+            elif "scout blaster" in i:
+                category = "Pistol"
+            elif "stun baton" in i:
+                category = "One Hand"
+            elif "rifle" in i:
+                category = "Rifle"
+            elif "Vibro Knuckler" in i:
+                category = "Unarmed"
+
+    elif entry_type == "purchase":
+        if "geonosian power cube" in i:
             category = "Component"
-        elif "holocron" in i:
-            category = "Misc"
-        elif "nightsister clothing" in i:
-            category = "Schematic"
-        elif "pearl" in i:
-            category = "Pearl"
-        elif "schematic" in i:
-            category = "Schematics"
-        elif "venom" in i:
-            category = "Component"
-        elif "treasure map" in i:
-            category = "Treasure Map"
-
-        ############# Looted Weapons #############
-        elif "carbine" in i:
-            category = "Carbine"
-        elif "two-handed curved sword" in i:
-            category = "Two Hand"
-        elif "curved sword" in i:
-            category = "One Hand"
-        elif "dl44 xt" in i:
-            category = "Pistol"
-        elif "flame thrower" in i or "flamethrower" in i:
-            category = "Commando"
-        elif "launcher pistol" in i:
-            category = "Commando"
-        elif "Long Vibro Axe" in i:
-            category = "Polearm"
-        elif "nightsister energy lance" in i:
-            category = "Polearm"
-        elif "pistol" in i:
-            category = "Pistol"
-        elif "power hammer" in i:
-            category = "Two Hand"
-        elif "republic blaster" in i:
-            category = "Pistol"
-        elif "scout blaster" in i:
-            category = "Pistol"
-        elif "stun baton" in i:
-            category = "One Hand"
-        elif "rifle" in i:
-            category = "Rifle"
-        elif "Vibro Knuckler" in i:
-            category = "Unarmed"
 
     return profession, category
 
@@ -421,34 +454,47 @@ def main():
     print(f"[INFO] Found {len(mail_files)} .mail file(s). Parsing and inserting into {args.db} ...")
 
     for p in mail_files:
-        sale = parse_mail_file(p)
-        if not sale:
+        entry = parse_mail_file(p)
+        if not entry:
             failed += 1
             continue
 
-        # Trim suffix from item name (e.g., " | Epak")
-        sale["item"] = re.sub(r"\s*\|\s*Epak\s*$", "", sale["item"], flags=re.IGNORECASE)
+        if entry["type"] == "sale":
+            entry["item"] = re.sub(r"\s*\|\s*Epak\s*$", "", entry["item"], flags=re.IGNORECASE)
+            profession, category = classify_vendor_and_item(entry["type"], entry["vendor"], entry["item"])
+            try:
+                row_id = insert_sale(
+                    conn,
+                    sale_date=entry["sale_date"],
+                    vendor=entry["vendor"],
+                    item=entry["item"],
+                    customer=entry["customer"],
+                    amount=entry["amount"],
+                    profession=profession,
+                    category=category,
+                )
+                inserted += 1
+                print(f"  ✔ SALE id={row_id} :: {entry['vendor']} → {entry['customer']} | {entry['item']}:{profession}:{category}")
+            except Exception as e:
+                failed += 1
+                print(f"  ✖ Failed to insert sale from {p.name}: {e}")
 
-        # Auto-classify based on vendor and item
-        profession, category = classify_vendor_and_item(sale["vendor"], sale["item"])
-
-        try:
-            row_id = insert_sale(
-                conn,
-                sale_date=sale["sale_date"],
-                vendor=sale["vendor"],
-                item=sale["item"],
-                customer=sale["customer"],
-                amount=sale["amount"],
-                profession=profession,
-                category=category,
-            )
-            inserted += 1
-            print(
-                f"  ✔ Inserted id={row_id} :: {sale['vendor']} → {sale['customer']} | {sale['item']} | {profession or ''}/{category or ''}")
-        except Exception as e:
-            failed += 1
-            print(f"  ✖ Failed to insert from {p.name}: {e}")
+        elif entry["type"] == "purchase":
+            profession, category = classify_vendor_and_item(entry["type"], entry["vendor"], entry["item"])
+            try:
+                row_id = insert_purchase(
+                    conn,
+                    sale_date=entry["sale_date"],
+                    item=entry["item"],
+                    vendor=entry["vendor"],
+                    amount=entry["amount"],
+                    category=category,
+                )
+                inserted += 1
+                print(f"  ✔ PURCHASE id={row_id} :: {entry['item']}:{category} from {entry['vendor']}")
+            except Exception as e:
+                failed += 1
+                print(f"  ✖ Failed to insert purchase from {p.name}: {e}")
 
 
 if __name__ == "__main__":
