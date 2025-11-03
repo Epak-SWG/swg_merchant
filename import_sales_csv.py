@@ -41,13 +41,51 @@ CREATE TABLE IF NOT EXISTS sales (
     FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_sales_date        ON sales(sale_date);
-CREATE INDEX IF NOT EXISTS idx_sales_vendor      ON sales(vendor);
-CREATE INDEX IF NOT EXISTS idx_sales_customer    ON sales(customer_id);
-CREATE INDEX IF NOT EXISTS idx_sales_item        ON sales(item);
-CREATE INDEX IF NOT EXISTS idx_sales_profession  ON sales(profession);
-CREATE INDEX IF NOT EXISTS idx_sales_category    ON sales(category);
-CREATE INDEX IF NOT EXISTS idx_customers_name    ON customers(name);
+CREATE TABLE IF NOT EXISTS purchases (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_date  TEXT    NOT NULL,
+    item       TEXT    NOT NULL,
+    vendor     TEXT    NOT NULL,
+    amount     INTEGER NOT NULL CHECK (amount >= 0),
+    category   TEXT
+);
+
+/* ---------- Single-row ingest table (replaces processed_mails + mail_rows) ----------
+   Exactly ONE row per .mail file.
+   Each row points to either a sales.id OR a purchases.id via FK.
+*/
+CREATE TABLE IF NOT EXISTS mail_ingests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    mail_id      TEXT,              -- first non-empty line in the file (if present)
+    file_path    TEXT NOT NULL UNIQUE,     -- absolute path
+    file_mtime   INTEGER NOT NULL,  -- os.stat().st_mtime
+    inserted_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    sale_id      INTEGER,           -- FK to sales.id (nullable)
+    purchase_id  INTEGER,           -- FK to purchases.id (nullable)
+
+    CHECK (
+      (sale_id IS NOT NULL AND purchase_id IS NULL) OR
+      (sale_id IS NULL     AND purchase_id IS NOT NULL)
+    ),
+
+    UNIQUE (mail_id),
+
+    FOREIGN KEY (sale_id)     REFERENCES sales(id)      ON DELETE CASCADE,
+    FOREIGN KEY (purchase_id) REFERENCES purchases(id)  ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_mail_ingests_mtime ON mail_ingests(file_mtime);
+
+CREATE INDEX IF NOT EXISTS idx_purchases_date     ON purchases(sale_date);
+CREATE INDEX IF NOT EXISTS idx_purchases_category ON purchases(category);
+CREATE INDEX IF NOT EXISTS idx_purchases_vendor   ON purchases(vendor);
+CREATE INDEX IF NOT EXISTS idx_sales_date         ON sales(sale_date);
+CREATE INDEX IF NOT EXISTS idx_sales_vendor       ON sales(vendor);
+CREATE INDEX IF NOT EXISTS idx_sales_customer     ON sales(customer_id);
+CREATE INDEX IF NOT EXISTS idx_sales_item         ON sales(item);
+CREATE INDEX IF NOT EXISTS idx_sales_profession   ON sales(profession);
+CREATE INDEX IF NOT EXISTS idx_sales_category     ON sales(category);
+CREATE INDEX IF NOT EXISTS idx_customers_name     ON customers(name);
 """
 
 def ensure_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
