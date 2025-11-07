@@ -1,30 +1,71 @@
 # SWG Merchant Log Parser → SQLite
 
-A Python 3 utility that parses Star Wars Galaxies `.mail` vendor transaction logs into a normalized SQLite database.
+A Python 3 utility that parses Star Wars Galaxies `.mail` vendor transaction logs into a normalized SQLite database and generates **data-driven vendor recommendations**.
 
-## Features
+---
+
+## ✨ Features
 
 - Parses both **sales** (`Vendor Sale Complete`) and **purchases** (`Vendor Item Purchased`) from `.mail` files.
 - Creates and maintains SQLite tables: `customers`, `sales`, `purchases`, and `mail_ingests`.
 - Prevents duplicate parsing and auto-reparses incomplete records.
-- Recursive scanning by default to fill missing information on previous logged mails.
-- Automatically classifies vendors and items by profession and category.
+- Recursive scanning to fill missing information from prior logs.
+- Automatically classifies vendors and items by **profession** and **category**.
+- Supports **crafting and stocking recommendations** via the `--recommend` CLI.
+- New filters: `--profession` and `--category` for focused analytics.
 - Trims trailing suffixes like `| Epak` from item names.
 
-## Usage
+---
 
+## 🧭 Usage
+
+### Parse Mail Logs
 ```bash
-# Parse all .mail files in a folder (non-recursive)
-python swg_merchant.py /path/to/folder
+# Parse all .mail files in a folder (recursive)
+python swg_merchant.py "C:\SWGInfinity2\profiles\Epak\SWG Infinity"
 
 # Parse a single .mail file
-python swg_merchant.py /path/to/file.mail
+python swg_merchant.py "C:\SWGInfinity2\profiles\Epak\SWG Infinity\mail_Epak-Inc\250006499.mail"
 
 # Use a custom database path
 python swg_merchant.py /path/to/folder --db ./swg_merchant.db
 ```
 
-## Database Schema
+---
+
+### Generate Crafting Recommendations
+The `--recommend` command analyzes recent sales and suggests what to restock or produce next.
+
+```bash
+# General recommendations for the last 30 days
+python swg_merchant.py --recommend
+
+# Focus on a specific profession
+python swg_merchant.py --recommend --profession Doctor
+
+# Combine multiple professions
+python swg_merchant.py --recommend --profession "Bio-Engineer" Doctor
+
+# Focus on certain item categories
+python swg_merchant.py --recommend --category Buff PSG Vehicle
+
+# Combine both filters for very specific insights
+python swg_merchant.py --recommend --profession Doctor --category Buff "Buff Packs"
+
+# Longer lookback and larger output
+python swg_merchant.py --recommend --days 90 --top 30
+```
+
+#### 🔍 Recommendation Output Sections
+1. **Top Items to Restock** — items sold frequently in the past `--days` days  
+2. **Hottest Categories** — categories with the most recent volume and credits  
+3. **Trending Categories** — month-over-month category growth or decline  
+
+Each section automatically respects `--profession` and `--category` filters if provided.
+
+---
+
+## 🗄️ Database Schema
 
 ### customers
 | Column | Type | Description |
@@ -67,7 +108,11 @@ python swg_merchant.py /path/to/folder --db ./swg_merchant.db
 | sale_id | INTEGER | FK to sales.id (nullable) |
 | purchase_id | INTEGER | FK to purchases.id (nullable) |
 
-## Example Query
+---
+
+## 🧮 Example Query
+
+Total credits earned per year (sales + purchases):
 
 ```sql
 SELECT strftime('%Y', sale_date) AS year, SUM(amount) AS total_credits
@@ -79,11 +124,15 @@ FROM purchases
 GROUP BY year;
 ```
 
-## Requirements
+---
 
-- Python ≥ 3.9
+## ⚙️ Requirements
+
+- Python ≥ 3.9  
 - Standard library only (`sqlite3`, `argparse`, `pathlib`, `re`, `datetime`)
 
-## License
+---
 
-MIT License — feel free to modify and extend.
+## 📜 License
+
+MIT License — free to modify, extend, and share.
