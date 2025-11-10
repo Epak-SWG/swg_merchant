@@ -1,19 +1,20 @@
 # SWG Merchant Log Parser → SQLite
 
-A Python 3 utility that parses Star Wars Galaxies `.mail` vendor transaction logs into a normalized SQLite database and generates **data-driven vendor recommendations**.
+A Python 3 utility that parses Star Wars Galaxies `.mail` vendor transaction logs into a normalized SQLite database and generates both **data-driven vendor recommendations** and **sales analytics reports**.
 
 ---
 
 ## ✨ Features
 
-- Parses both **sales** (`Vendor Sale Complete`) and **purchases** (`Vendor Item Purchased`) from `.mail` files.
-- Creates and maintains SQLite tables: `customers`, `sales`, `purchases`, and `mail_ingests`.
-- Prevents duplicate parsing and auto-reparses incomplete records.
-- Recursive scanning to fill missing information from prior logs.
-- Automatically classifies vendors and items by **profession** and **category**.
-- Supports **crafting and stocking recommendations** via the `--recommend` CLI.
-- New filters: `--profession` and `--category` for focused analytics.
-- Trims trailing suffixes like `| Epak` from item names.
+- Parses both **sales** (`Vendor Sale Complete`) and **purchases** (`Vendor Item Purchased`) from `.mail` files.  
+- Creates and maintains SQLite tables: `customers`, `sales`, `purchases`, and `mail_ingests`.  
+- Prevents duplicate parsing and auto-reparses incomplete records.  
+- Recursive scanning to fill missing information from prior logs.  
+- Automatically classifies vendors and items by **profession** and **category**.  
+- Supports **crafting and stocking recommendations** via the `--recommend` CLI.  
+-- New filters: `--profession` and `--category` for focused analytics.  
+- Trims trailing suffixes like `| Epak` from item names.  
+- Includes a powerful **reporting engine (`report.py`)** for 12-month, year-to-date, or all-history summaries in Markdown and CSV.  
 
 ---
 
@@ -62,6 +63,47 @@ python swg_merchant.py --recommend --days 90 --top 30
 3. **Trending Categories** — month-over-month category growth or decline  
 
 Each section automatically respects `--profession` and `--category` filters if provided.
+
+---
+
+## 📊 Generate Analytics Reports
+
+The standalone **`report.py`** script produces rich Markdown or CSV summaries from the SQLite database.
+
+### Run Examples
+
+```bash
+# Rolling 12-month report (default)
+python report.py --db ./swg_merchant.db
+
+# Year-to-date report (Jan 1 → today)
+python report.py --db ./swg_merchant.db --ytd
+
+# All historical data (no date filters)
+python report.py --db ./swg_merchant.db --all
+
+# Custom lookback window
+python report.py --db ./swg_merchant.db --months 6
+
+# Save report and CSV extracts
+python report.py --db ./swg_merchant.db --out ./report.md --csv-dir ./report_csv
+```
+
+### 📄 Report Sections
+
+| Section | Description |
+|----------|--------------|
+| **Summary KPIs** | Revenue, purchases, margin, sales counts, customer and vendor totals |
+| **Monthly Sales Trend** | Month-by-month totals with MoM deltas |
+| **Sales by Category** | Top categories by sales and revenue |
+| **Sales by Profession** | Breakdown by vendor profession |
+| **Top Items & Vendors** | Top 10 items and vendors by quantity and credits |
+| **Purchases Overview** | Monthly purchase trends and vendor spend |
+| **Category Margin** | Sales − Purchases per category |
+| **Customer Summary** | Active, new, and lifetime-returning customers, repeat-purchase rate |
+| **Top Customers** | Highest spenders and most frequent buyers |
+
+Reports can be printed to the console, saved as Markdown, or exported as CSVs for use in spreadsheets or BI tools.
 
 ---
 
@@ -129,7 +171,7 @@ GROUP BY year;
 ## ⚙️ Requirements
 
 - Python ≥ 3.9  
-- Standard library only (`sqlite3`, `argparse`, `pathlib`, `re`, `datetime`)
+- Standard library only (`sqlite3`, `argparse`, `pathlib`, `re`, `datetime`)  
 
 ---
 
