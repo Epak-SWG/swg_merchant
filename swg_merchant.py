@@ -6,7 +6,7 @@ SWG Merchant Log Parser → SQLite
 import re
 import sqlite3
 from pathlib import Path
-from datetime import datetime, timezone
+import datetime
 from typing import Optional, Iterable, Sequence
 
 # ---------- DB ----------
@@ -180,7 +180,7 @@ def parse_mail_file(file_path: Path) -> Optional[dict]:
         print(f"[WARN] {file_path.name}: invalid TIMESTAMP value.")
         return None
 
-    sale_date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    sale_date = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
     if "Vendor Sale Complete" in event_line:
         sm = SALE_RE.search(sale_line)
@@ -248,6 +248,8 @@ def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[O
             elif "vibro knuckler" in i: category = "Unarmed"
             elif "flame thrower" in i or "flamethrower" in i or "launcher pistol" in i: category = "Commando"
             elif "pistol" in i or "dl44 xt" in i: category = "Pistol"
+            elif "long vibro axe" in i or "nightsister energy lance" in i:
+                category = "Polearm"
         elif "world drops" in v:
             profession = "loot"
             if any(w in i for w in ["[ca]","[aa]"]): category = "Tapes"
@@ -266,6 +268,8 @@ def classify_vendor_and_item(entry_type: str, vendor: str, item: str) -> tuple[O
     elif entry_type == "purchase":
         if "geonosian power cube" in i: category = "Component"
         elif "blood" in i: category = "Blood"
+        elif "aurilian plant" in i: category = "Aurilian"
+        elif "cpu>" in i: category = "Resources"
     return profession, category
 
 # ---------- File discovery & inserts ----------
